@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <endian.h>
 #include <memory>
 #include <string>
 #include <utility>
@@ -78,27 +79,64 @@ JoinerSession::JoinerSession(CommissionerImpl  &aCommImpl,
     , mJoinerUdpPort(aJoinerUdpPort)
     , mJoinerRouterLocator(aJoinerRouterLocator)
     , mRelaySocket(std::make_shared<RelaySocket>(*this, aJoinerAddr, aJoinerPort, aLocalAddr, aLocalPort))
-    , mDtlsSession(std::make_shared<DtlsSession>(aCommImpl.GetEventBase(), /* aIsServer */ true, mRelaySocket))
-    , mCoap(aCommImpl.GetEventBase(), *mDtlsSession)
     , mResourceJoinFin(uri::kJoinFin, [this](const coap::Request &aRequest) { HandleJoinFin(aRequest); })
 {
-    SuccessOrDie(mCoap.AddResource(mResourceJoinFin));
+    uint64_t joinerId;
+
+    memcpy(&joinerId, mJoinerId.data(), sizeof(joinerId));
+    joinerId = be64toh(joinerId);
+
+    if (mJoinerPSKd.empty())
+    {
+        mRelaySocket->SetEventHandler([this, joinerId](short aFlags) {
+            if (aFlags & EV_READ)
+            {
+                uint8_t  buf[1280];
+                uint16_t port;
+
+                while (true)
+                {
+                    int len = mRelaySocket->Receive(buf, sizeof(buf), port);
+                    LOG_DEBUG(LOG_REGION_JOINER_SESSION, "Forwarding messages from the joiner at port:{}", port);
+                    if (len <= 0)
+                    {
+                        break;
+                    }
+
+                    mCommImpl.mCommissionerHandler.onJoinerMessage(joinerId, port, buf, len);
+                }
+            }
+        });
+    }
+    else
+    {
+        mDtlsSession = std::make_shared<DtlsSession>(aCommImpl.GetEventBase(), /* aIsServer */ true, mRelaySocket);
+        mCoap.reset(new coap::Coap(aCommImpl.GetEventBase(), *mDtlsSession));
+        SuccessOrDie(mCoap->AddResource(mResourceJoinFin));
+    }
 }
 
 void JoinerSession::Connect()
 {
     Error error;
 
-    auto dtlsConfig = GetDtlsConfig(mCommImpl.GetConfig());
-    dtlsConfig.mPSK = {mJoinerPSKd.begin(), mJoinerPSKd.end()};
-
-    mExpirationTime = Clock::now() + MilliSeconds(kDtlsHandshakeTimeoutMax * 1000 + kJoinerTimeout * 1000);
-
-    SuccessOrExit(error = mDtlsSession->Init(dtlsConfig));
-
+    if (mJoinerPSKd.empty())
     {
-        auto onConnected = [this](const DtlsSession &, Error aError) { HandleConnect(aError); };
-        mDtlsSession->Connect(onConnected);
+        mExpirationTime = Clock::now() + MilliSeconds(kDtlsHandshakeTimeoutMax * 1000 + kJoinerTimeout * 1000);
+    }
+    else
+    {
+        auto dtlsConfig = GetDtlsConfig(mCommImpl.GetConfig());
+        dtlsConfig.mPSK = {mJoinerPSKd.begin(), mJoinerPSKd.end()};
+
+        mExpirationTime = Clock::now() + MilliSeconds(kDtlsHandshakeTimeoutMax * 1000 + kJoinerTimeout * 1000);
+
+        SuccessOrExit(error = mDtlsSession->Init(dtlsConfig));
+
+        {
+            auto onConnected = [this](const DtlsSession &, Error aError) { HandleConnect(aError); };
+            mDtlsSession->Connect(onConnected);
+        }
     }
 
 exit:
@@ -120,19 +158,20 @@ void JoinerSession::HandleConnect(Error aError)
     mCommImpl.mCommissionerHandler.OnJoinerConnected(mJoinerId, aError);
 }
 
-void JoinerSession::RecvJoinerDtlsRecords(const ByteArray &aRecords)
+void JoinerSession::RecvJoinerDtlsRecords(const ByteArray &aRecords, uint16_t aJoinerUdpPort)
 {
-    mRelaySocket->RecvJoinerDtlsRecords(aRecords);
+    // this is the SRP Update
+    mRelaySocket->RecvJoinerDtlsRecords(aRecords, aJoinerUdpPort);
 }
 
-Error JoinerSession::SendRlyTx(const ByteArray &aDtlsMessage, bool aIncludeKek)
+Error JoinerSession::SendRlyTx(const ByteArray &aDtlsMessage, bool aIncludeKek, uint16_t aJoinerUdpPort)
 {
     Error         error;
     coap::Request rlyTx{coap::Type::kNonConfirmable, coap::Code::kPost};
 
     SuccessOrExit(error = rlyTx.SetUriPath(uri::kRelayTx));
 
-    SuccessOrExit(error = AppendTlv(rlyTx, {tlv::Type::kJoinerUdpPort, GetJoinerUdpPort()}));
+    SuccessOrExit(error = AppendTlv(rlyTx, {tlv::Type::kJoinerUdpPort, aJoinerUdpPort}));
     SuccessOrExit(error = AppendTlv(rlyTx, {tlv::Type::kJoinerRouterLocator, GetJoinerRouterLocator()}));
     SuccessOrExit(error = AppendTlv(rlyTx, {tlv::Type::kJoinerIID, GetJoinerIid()}));
     SuccessOrExit(error = AppendTlv(rlyTx, {tlv::Type::kJoinerDtlsEncapsulation, aDtlsMessage}));
@@ -144,6 +183,10 @@ Error JoinerSession::SendRlyTx(const ByteArray &aDtlsMessage, bool aIncludeKek)
     }
 
     mCommImpl.mBrClient.SendRequest(rlyTx, nullptr);
+
+    VerifyOrExit(!mJoinerPSKd.empty(),
+                 LOG_INFO(LOG_REGION_JOINER_SESSION, "session(={}) sent RLY_TX.ntf: joinerID={}, length={}",
+                          static_cast<void *>(this), utils::Hex(GetJoinerId()), aDtlsMessage.size()));
 
     LOG_DEBUG(LOG_REGION_JOINER_SESSION,
               "session(={}) sent RLY_TX.ntf: SessionState={}, joinerID={}, length={}, includeKek={}",
@@ -230,7 +273,7 @@ void JoinerSession::SendJoinFinResponse(const coap::Request &aJoinFinReq, bool a
     SuccessOrExit(error = AppendTlv(joinFin, {tlv::Type::kState, aAccept ? tlv::kStateAccept : tlv::kStateReject}));
 
     joinFin.SetSubType(MessageSubType::kJoinFinResponse);
-    SuccessOrExit(error = mCoap.SendResponse(aJoinFinReq, joinFin));
+    SuccessOrExit(error = mCoap->SendResponse(aJoinFinReq, joinFin));
 
     LOG_INFO(LOG_REGION_JOINER_SESSION, "session(={}) sent JOIN_FIN.rsp: accepted={}", static_cast<void *>(this),
              aAccept);
@@ -278,12 +321,12 @@ JoinerSession::RelaySocket::RelaySocket(RelaySocket &&aOther)
 {
 }
 
-int JoinerSession::RelaySocket::Send(const uint8_t *aBuf, size_t aLen)
+int JoinerSession::RelaySocket::Send(const uint8_t *aBuf, size_t aLen, uint16_t aPort)
 {
     Error error;
     bool  includeKek = GetSubType() == MessageSubType::kJoinFinResponse;
 
-    SuccessOrExit(error = mJoinerSession.SendRlyTx({aBuf, aBuf + aLen}, includeKek));
+    SuccessOrExit(error = mJoinerSession.SendRlyTx({aBuf, aBuf + aLen}, includeKek, aPort));
 
 exit:
     if (error != ErrorCode::kNone)
@@ -294,23 +337,31 @@ exit:
     return error == ErrorCode::kNone ? static_cast<int>(aLen) : MBEDTLS_ERR_NET_SEND_FAILED;
 }
 
-int JoinerSession::RelaySocket::Receive(uint8_t *aBuf, size_t aMaxLen)
+int JoinerSession::RelaySocket::Receive(uint8_t *aBuf, size_t aMaxLen, uint16_t &aUdpPort)
 {
     int rval;
 
-    VerifyOrExit(!mRecvBuf.empty(), rval = MBEDTLS_ERR_SSL_WANT_READ);
+    if (mRecvBufs.empty())
+    {
+        return MBEDTLS_ERR_SSL_WANT_READ;
+    }
 
-    rval = static_cast<int>(std::min(aMaxLen, mRecvBuf.size()));
-    memcpy(aBuf, mRecvBuf.data(), rval);
-    mRecvBuf.erase(mRecvBuf.begin(), mRecvBuf.begin() + rval);
+    const auto &packet = mRecvBufs.front();
 
-exit:
+    const auto &buf = packet.first;
+    aUdpPort        = packet.second;
+
+    rval = static_cast<int>(std::min(aMaxLen, buf.size()));
+    memcpy(aBuf, buf.data(), rval);
+
+    mRecvBufs.pop();
+
     return rval;
 }
 
-void JoinerSession::RelaySocket::RecvJoinerDtlsRecords(const ByteArray &aRecords)
+void JoinerSession::RelaySocket::RecvJoinerDtlsRecords(const ByteArray &aRecords, uint16_t aJoinerUdpPort)
 {
-    mRecvBuf.insert(mRecvBuf.end(), aRecords.begin(), aRecords.end());
+    mRecvBufs.push(std::make_pair(aRecords, aJoinerUdpPort));
 
     // Notifies the DTLS session that there is incoming data.
     event_active(&mEvent, EV_READ, 0);

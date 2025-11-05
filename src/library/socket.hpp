@@ -121,6 +121,8 @@ public:
     uint16_t GetPeerPort() const override;
     Address  GetPeerAddr() const override;
 
+    bool IsBound() const { return mIsBound; }
+
     int Send(const uint8_t *aBuf, size_t aLen) override;
 
     int Receive(uint8_t *aBuf, size_t aMaxLen) override;

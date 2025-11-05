@@ -43,6 +43,8 @@
 #include <utility>
 #include <vector>
 
+#include <endian.h>
+
 #include "commissioner/commissioner.hpp"
 #include "commissioner/defines.hpp"
 #include "commissioner/error.hpp"
@@ -2890,7 +2892,7 @@ void CommissionerImpl::HandleRlyRx(const coap::Request &aRlyRx)
             Address localAddr;
 
             joinerPSKd = mCommissionerHandler.OnJoinerRequest(joinerId);
-            if (joinerPSKd.empty())
+            if (joinerPSKd.empty() && !mConfig.mProxyMode)
             {
                 LOG_INFO(LOG_REGION_JOINER_SESSION, "joiner(ID={}) is disabled", utils::Hex(joinerId));
                 ExitNow(error = ERROR_REJECTED("joiner(ID={}) is disabled", utils::Hex(joinerId)));
@@ -2920,7 +2922,7 @@ void CommissionerImpl::HandleRlyRx(const coap::Request &aRlyRx)
 
         ASSERT(it != mJoinerSessions.end());
         auto &session = it->second;
-        session.RecvJoinerDtlsRecords(dtlsRecords);
+        session.RecvJoinerDtlsRecords(dtlsRecords, joinerUdpPort);
     }
 
 exit:
@@ -2965,6 +2967,51 @@ void CommissionerImpl::HandleJoinerSessionTimer(Timer &aTimer)
     if (hasNextShot)
     {
         aTimer.Start(nextShot);
+    }
+}
+
+void CommissionerImpl::EnableAllJoiners(ErrorHandler aHandler)
+{
+    ByteArray           joinerId;
+    CommissionerDataset dataset;
+
+    if (!IsActive())
+    {
+        LOG_ERROR(LOG_REGION_MGMT, "Commissioner is not active");
+        aHandler(ERROR_INVALID_STATE("Commissioner is not active"));
+        return;
+    }
+
+    LOG_INFO(LOG_REGION_MGMT, "Commissioner is active");
+
+    dataset.mJoinerUdpPort = kDefaultJoinerUdpPort;
+    dataset.mPresentFlags |= CommissionerDataset::kJoinerUdpPortBit;
+
+    dataset.mPresentFlags &= ~CommissionerDataset::kSessionIdBit;
+    dataset.mPresentFlags &= ~CommissionerDataset::kBorderAgentLocatorBit;
+
+    dataset.mSteeringData = {0xFF};
+    dataset.mPresentFlags |= CommissionerDataset::kSteeringDataBit;
+
+    SetCommissionerDataset(aHandler, dataset);
+}
+
+void CommissionerImpl::SendToJoiner(uint64_t joinerId, uint16_t joinerPort, const uint8_t *buf, uint16_t len)
+{
+    uint64_t  joinerIdBe = htobe64(joinerId);
+    ByteArray key(reinterpret_cast<uint8_t *>(&joinerIdBe),
+                  reinterpret_cast<uint8_t *>(&joinerIdBe) + sizeof(joinerIdBe));
+
+    auto it = mJoinerSessions.find(key);
+    if (it == mJoinerSessions.end())
+    {
+        LOG_WARN(LOG_REGION_MGMT, "Joiner[{:#x}] not found", joinerId);
+    }
+    else
+    {
+        auto error = it->second.SendTo(joinerPort, buf, len);
+        LOG_INFO(LOG_REGION_MGMT, "Send to joiner joiner={:#x} port={}: {}", joinerId, joinerPort,
+                 error.GetMessage().c_str());
     }
 }
 

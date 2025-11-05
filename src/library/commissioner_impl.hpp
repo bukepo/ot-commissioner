@@ -202,6 +202,12 @@ public:
 
     struct event_base *GetEventBase() { return mEventBase; }
 
+    void EnableAllJoiners(ErrorHandler aHandler) override;
+
+    Error EnableAllJoiners() override { return ERROR_UNIMPLEMENTED(""); }
+
+    virtual void SendToJoiner(uint64_t joinerId, uint16_t joinerPort, const uint8_t *buf, uint16_t len) override;
+
 private:
     using AsyncRequest = std::function<void()>;
 

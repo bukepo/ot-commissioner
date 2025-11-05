@@ -625,6 +625,26 @@ struct event_base *CommissionerSafe::EventBaseHolder::Get()
     return mEventBase;
 }
 
+void CommissionerSafe::EnableAllJoiners(ErrorHandler aHandler)
+{
+    PushAsyncRequest([=]() { mImpl->EnableAllJoiners(aHandler); });
+}
+
+Error CommissionerSafe::EnableAllJoiners()
+{
+    std::promise<Error> pro;
+    auto                wait = [&pro](Error aError) { pro.set_value(aError); };
+
+    EnableAllJoiners(wait);
+    return pro.get_future().get();
+}
+
+void CommissionerSafe::SendToJoiner(uint64_t joinerId, uint16_t joinerPort, const uint8_t *buf, uint16_t len)
+{
+    auto buffer = std::make_shared<ByteArray>(buf, buf + len);
+
+    PushAsyncRequest([=]() { mImpl->SendToJoiner(joinerId, joinerPort, buffer->data(), buffer->size()); });
+}
 } // namespace commissioner
 
 } // namespace ot

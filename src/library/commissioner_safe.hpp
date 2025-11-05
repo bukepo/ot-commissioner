@@ -188,6 +188,9 @@ public:
 
     Error SetToken(const ByteArray &aSignedToken) override;
 
+    void  EnableAllJoiners(ErrorHandler aHandler) override;
+    Error EnableAllJoiners() override;
+
 private:
     using AsyncRequest = std::function<void()>;
 
@@ -198,6 +201,8 @@ private:
 
     void StartEventLoopThread();
     void StopEventLoopThread();
+
+    virtual void SendToJoiner(uint64_t joinerId, uint16_t joinerPort, const uint8_t *buf, uint16_t len) override;
 
 private:
     class EventBaseHolder

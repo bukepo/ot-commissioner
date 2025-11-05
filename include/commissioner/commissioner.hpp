@@ -100,6 +100,8 @@ struct Config
 {
     bool mEnableCcm = true; ///< If enable CCM feature.
 
+    bool mProxyMode = false; ///< If enable commissioning proxy feature.
+
     // Allowed range: [30, 45] seconds.
     uint32_t mKeepAliveInterval = 40;  ///< The interval of keep-alive message. In seconds.
     uint32_t mMaxConnectionNum  = 100; ///< Max number of parallel connection from joiner.
@@ -281,6 +283,8 @@ public:
      *
      */
     virtual void OnDatasetChanged() {}
+
+    virtual void onJoinerMessage(uint64_t aJoiner, uint16_t aPort, const uint8_t *aBytes, uint16_t aLength) {}
 
     virtual ~CommissionerHandler() = default;
 };
@@ -1223,6 +1227,11 @@ public:
      *
      */
     virtual Error CommandDiagReset(const std::string &aAddr, uint64_t aDiagDataFlags) = 0;
+
+    virtual void  EnableAllJoiners(ErrorHandler aHandler) = 0;
+    virtual Error EnableAllJoiners()                      = 0;
+
+    virtual void SendToJoiner(uint64_t joinerId, uint16_t joinerPort, const uint8_t *buf, uint16_t len) = 0;
 };
 
 } // namespace commissioner
